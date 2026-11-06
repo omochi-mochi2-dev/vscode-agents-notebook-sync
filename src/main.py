@@ -20,6 +20,9 @@ from src.docs_client import (
     fetch_document_tabs,
     extract_tabs_info,
     generate_phase1_payload,
+    build_tab_prefix,
+    ORPHAN_MAX_RATIO,
+    ORPHAN_MAX_COUNT,
     generate_phase2_payload,
     split_requests_into_chunks,
     apply_batch_update
@@ -37,6 +40,9 @@ def main(force: bool = False) -> None:
         docs_service = init_docs_client(credentials_path)
 
         sync_targets = config.get('sync_targets', [])
+        orphan_config = config.get('orphan_cleanup') or {}
+        orphan_max_ratio = float(orphan_config.get('max_ratio', ORPHAN_MAX_RATIO))
+        orphan_max_count = int(orphan_config.get('max_count', ORPHAN_MAX_COUNT))
         
         if not sync_targets:
             logger.warning("No sync targets defined in config.")
@@ -106,12 +112,30 @@ def main(force: bool = False) -> None:
                             logger.error(f"Failed to fetch raw content for {d.filename}: {e}")
                             raise
 
+                # 孤立タブ削除は --force（全量スナップショット）時のみ。tree が切り詰められている場合は無効化する。
+                orphan_cleanup = force and not getattr(diffs, 'truncated', False)
+                if force and not orphan_cleanup:
+                    logger.warning(f"Orphan tab cleanup disabled for {source_path}: GitHub tree response was truncated.")
+                other_prefixes = [
+                    build_tab_prefix(other.get('source_path'))
+                    for other in watch_folders
+                    if other.get('source_path') and other.get('google_doc_id') == doc_id and other is not wf
+                ]
+
                 # 7. Google Docs同期 (2段階プロセス)
                 # Phase 1: 構造の同期（タブの作成・削除）
                 current_doc_state = fetch_document_tabs(docs_service, doc_id)
                 current_tab_map = extract_tabs_info(current_doc_state)
                 
-                phase1_reqs = generate_phase1_payload(folder_diffs, current_tab_map)
+                phase1_reqs = generate_phase1_payload(
+                    folder_diffs,
+                    current_tab_map,
+                    orphan_cleanup=orphan_cleanup,
+                    source_path=source_path,
+                    other_prefixes=other_prefixes,
+                    max_ratio=orphan_max_ratio,
+                    max_count=orphan_max_count,
+                )
                 if phase1_reqs:
                     logger.info(f"Phase 1: Executing structural changes (tabs creation/deletion) for {doc_id}.")
                     apply_batch_update(docs_service, doc_id, phase1_reqs)

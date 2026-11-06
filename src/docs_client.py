@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Sequence, Tuple
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -74,18 +74,104 @@ def extract_tabs_info(document_content: Dict[str, Any]) -> Dict[str, Dict[str, A
             
     return tab_info_map
 
-def generate_phase1_payload(diffs: List[FileDiff], current_tab_map: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+ORPHAN_MAX_RATIO: float = 0.5
+ORPHAN_MAX_COUNT: int = 20
+_TAB_TITLE_HASH_PREFIX_LENGTH: int = 41
+
+
+def build_tab_prefix(source_path: str) -> str:
+    """
+    watch_folder の source_path から、そのフォルダ配下のタブ名が共有するプレフィックスを生成する。
+    format_tab_title と同じ置換規則を適用し、末尾に '_' を付与する。
+    50文字超でハッシュ化されたタブ名にも一致するよう、先頭41文字までに切り詰める。
+    """
+    base = source_path.strip('/').replace('/', '_').replace('.', '_')
+    return f"{base}_"[:_TAB_TITLE_HASH_PREFIX_LENGTH]
+
+
+def detect_orphan_tabs(
+    diffs: List[FileDiff],
+    current_tab_map: Dict[str, Dict[str, Any]],
+    source_path: str,
+    other_prefixes: Sequence[str] = (),
+    max_ratio: float = ORPHAN_MAX_RATIO,
+    max_count: int = ORPHAN_MAX_COUNT,
+) -> List[str]:
+    """
+    全量同期時に、GitHub 側に存在しない孤立タブ名を特定して返す。
+
+    - 対象は source_path のプレフィックスを持つ既存タブのみ（手動作成タブ等は対象外）。
+    - 他の watch_folder のプレフィックス（より長く、かつ自身を内包するもの）に該当するタブは除外する。
+    - 安全対策: 期待タブが0件、孤立比率 > max_ratio、孤立件数 > max_count の場合は RuntimeError で中断する。
+    """
+    prefix = build_tab_prefix(source_path)
+    expected_tab_names = {
+        d.target_tab_name for d in diffs if d.status in ('added', 'modified', 'renamed')
+    }
+
+    candidates: List[str] = []
+    for tab_name in current_tab_map:
+        if not tab_name.startswith(prefix):
+            continue
+        if any(
+            other != prefix and other.startswith(prefix) and tab_name.startswith(other)
+            for other in other_prefixes
+        ):
+            continue
+        candidates.append(tab_name)
+
+    if not candidates:
+        return []
+
+    if not expected_tab_names:
+        logger.error(f"Fail-safe triggered: No expected tabs for '{source_path}' but {len(candidates)} existing tabs found. Aborting orphan cleanup.")
+        raise RuntimeError("Fail-safe: 同期対象ファイルが0件のため、孤立タブの削除を中断します。")
+
+    orphans = [name for name in candidates if name not in expected_tab_names]
+    if not orphans:
+        return []
+
+    ratio = len(orphans) / len(candidates)
+    if ratio > max_ratio:
+        logger.error(f"Fail-safe triggered: Orphan ratio {ratio:.2%} ({len(orphans)}/{len(candidates)}) exceeds limit {max_ratio:.2%} for '{source_path}'.")
+        raise RuntimeError(f"Fail-safe: 孤立タブの比率({ratio:.0%})が上限({max_ratio:.0%})を超えるため、削除を中断します。")
+    if len(orphans) > max_count:
+        logger.error(f"Fail-safe triggered: Orphan count {len(orphans)} exceeds limit {max_count} for '{source_path}'.")
+        raise RuntimeError(f"Fail-safe: 孤立タブ数({len(orphans)})が上限({max_count})を超えるため、削除を中断します。")
+
+    logger.warning(f"Orphan tabs detected for '{source_path}' ({len(orphans)}): {sorted(orphans)}")
+    return orphans
+
+
+def generate_phase1_payload(
+    diffs: List[FileDiff],
+    current_tab_map: Dict[str, Dict[str, Any]],
+    orphan_cleanup: bool = False,
+    source_path: Optional[str] = None,
+    other_prefixes: Sequence[str] = (),
+    max_ratio: float = ORPHAN_MAX_RATIO,
+    max_count: int = ORPHAN_MAX_COUNT,
+) -> List[Dict[str, Any]]:
     """
     Phase 1: タブの作成と削除を行うリクエストを生成する。
+    orphan_cleanup=True の場合（--force 時のみ）、GitHub 側に存在しない孤立タブの deleteTab も生成する。
     """
-    requests = []
+    requests: List[Dict[str, Any]] = []
+
+    orphan_names: List[str] = []
+    if orphan_cleanup:
+        if not source_path:
+            raise ValueError("source_path is required when orphan_cleanup is enabled.")
+        orphan_names = detect_orphan_tabs(
+            diffs, current_tab_map, source_path, other_prefixes, max_ratio, max_count
+        )
     
     if diffs and all(diff.status == 'removed' for diff in diffs):
         logger.error("Fail-safe triggered: All detected diffs are 'removed'. Aborting sync to prevent total document deletion.")
         raise RuntimeError("Fail-safe: 監視対象パス内の全ファイルが削除対象になっています。不正な全削除を防ぐため処理を中断します。")
 
     # 事前に最終的なタブ数をシミュレーションして上限チェック
-    expected_tab_names = set(current_tab_map.keys())
+    expected_tab_names = set(current_tab_map.keys()) - set(orphan_names)
     for diff in diffs:
         target_tab_name = diff.target_tab_name
         if diff.status == 'removed':
@@ -102,15 +188,25 @@ def generate_phase1_payload(diffs: List[FileDiff], current_tab_map: Dict[str, Di
         logger.error(f"Fail-safe triggered: Estimated tab count ({len(expected_tab_names)}) exceeds the Google Docs limit of 100.")
         raise RuntimeError(f"1ドキュメントのタブ数上限(100)を超過するため処理を中断します（予測タブ数: {len(expected_tab_names)}）。対象ファイルを減らすか設定を分割してください。")
 
+    already_deleted: set = set()
+    for orphan_name in orphan_names:
+        requests.append({
+            "deleteTab": {
+                "tabId": current_tab_map[orphan_name]['tabId']
+            }
+        })
+        already_deleted.add(orphan_name)
+
     for diff in diffs:
         target_tab_name = diff.target_tab_name
         
         if diff.status == 'removed':
+            if target_tab_name in already_deleted:
+                continue
             if target_tab_name in current_tab_map:
-                tab_id = current_tab_map[target_tab_name]['tabId']
                 requests.append({
                     "deleteTab": {
-                        "tabId": tab_id
+                        "tabId": current_tab_map[target_tab_name]['tabId']
                     }
                 })
             else:
@@ -129,7 +225,7 @@ def generate_phase1_payload(diffs: List[FileDiff], current_tab_map: Dict[str, Di
             # renamedの場合は古いタブの削除も同時に行う
             if diff.status == 'renamed' and diff.previous_filename:
                 old_tab_name = format_tab_title(diff.previous_filename)
-                if old_tab_name in current_tab_map:
+                if old_tab_name in current_tab_map and old_tab_name not in already_deleted:
                     requests.append({
                         "deleteTab": {
                             "tabId": current_tab_map[old_tab_name]['tabId']

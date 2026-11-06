@@ -41,6 +41,14 @@ def get_latest_commit_sha(owner: str, repo: str, token: str, branch: str = 'main
             logger.error(f"Response body: {e.response.text}")
         raise ValueError(f"Failed to fetch latest commit sha: {e}")
 
+class FullSyncDiffs(List[FileDiff]):
+    """
+    全量同期で取得した FileDiff のリスト。
+    GitHub tree API のレスポンスが切り詰められた場合 (truncated=true) は truncated=True となる。
+    """
+    truncated: bool = False
+
+
 def fetch_all_files_as_added(owner: str, repo: str, head_sha: str, token: str) -> List[FileDiff]:
     url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{head_sha}?recursive=1"
     headers = {
@@ -59,9 +67,13 @@ def fetch_all_files_as_added(owner: str, repo: str, head_sha: str, token: str) -
             logger.error(f"Response body: {e.response.text}")
         raise ValueError(f"Failed to fetch tree: {e}")
         
-    tree = response.json().get('tree', [])
+    response_json = response.json()
+    tree = response_json.get('tree', [])
     
-    diffs = []
+    diffs = FullSyncDiffs()
+    diffs.truncated = bool(response_json.get('truncated', False))
+    if diffs.truncated:
+        logger.warning(f"Git tree response for {owner}/{repo}@{head_sha} is truncated. File list may be incomplete.")
     for item in tree:
         if item.get('type') == 'blob':
             filename = item.get('path')
