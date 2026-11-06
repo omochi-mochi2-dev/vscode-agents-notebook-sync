@@ -183,6 +183,49 @@ def generate_phase2_payload(diffs: List[FileDiff], latest_tab_map: Dict[str, Dic
                 
     return requests
 
+def _request_tab_id(request: Dict[str, Any]) -> Any:
+    """リクエストが対象とする tabId を返す（deleteContentRange / insertText 用）。"""
+    body: Dict[str, Any] = next(iter(request.values()), {})
+    if 'range' in body:
+        return body['range'].get('tabId')
+    if 'location' in body:
+        return body['location'].get('tabId')
+    return None
+
+def split_requests_into_chunks(
+    requests: List[Dict[str, Any]],
+    max_tabs: int = 10,
+    max_requests: int = 50
+) -> List[List[Dict[str, Any]]]:
+    """
+    Phase 2 のリクエストをタブ単位でグループ化し、1チャンクあたり最大 max_tabs タブ /
+    max_requests リクエストに収まるよう分割する。
+    同一タブの deleteContentRange と insertText は必ず同一チャンクに含め、アトミック性を維持する。
+    """
+    groups: List[List[Dict[str, Any]]] = []
+    last_tab_id: Any = object()
+    for req in requests:
+        tab_id = _request_tab_id(req)
+        if groups and tab_id is not None and tab_id == last_tab_id:
+            groups[-1].append(req)
+        else:
+            groups.append([req])
+        last_tab_id = tab_id
+
+    chunks: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    current_groups = 0
+    for group in groups:
+        if current and (current_groups >= max_tabs or len(current) + len(group) > max_requests):
+            chunks.append(current)
+            current = []
+            current_groups = 0
+        current.extend(group)
+        current_groups += 1
+    if current:
+        chunks.append(current)
+    return chunks
+
 def apply_batch_update(service: Any, document_id: str, requests: List[Dict[str, Any]]) -> None:
     """
     リクエストが存在する場合に batchUpdate を実行する。

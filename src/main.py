@@ -21,6 +21,7 @@ from src.docs_client import (
     extract_tabs_info,
     generate_phase1_payload,
     generate_phase2_payload,
+    split_requests_into_chunks,
     apply_batch_update
 )
 
@@ -126,8 +127,12 @@ def main(force: bool = False) -> None:
                 # Phase 2: コンテンツの同期（削除と挿入のアトミック処理）
                 phase2_reqs = generate_phase2_payload(folder_diffs, latest_tab_map, file_contents)
                 if phase2_reqs:
-                    logger.info(f"Phase 2: Executing content updates for {doc_id}.")
-                    apply_batch_update(docs_service, doc_id, phase2_reqs)
+                    chunks = split_requests_into_chunks(phase2_reqs)
+                    total_chunks = len(chunks)
+                    logger.info(f"Phase 2: Executing content updates for {doc_id} ({len(phase2_reqs)} requests in {total_chunks} batches).")
+                    for i, chunk in enumerate(chunks, start=1):
+                        logger.info(f"Applying Phase 2 updates (batch {i}/{total_chunks}, {len(chunk)} requests)...")
+                        apply_batch_update(docs_service, doc_id, chunk)
                 else:
                     logger.info(f"Phase 2: No content updates required for {source_path}.")
                     
