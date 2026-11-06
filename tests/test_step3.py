@@ -10,6 +10,12 @@ from src.main import main
 
 class TestStep3(unittest.TestCase):
 
+    def setUp(self):
+        # fetch_repository_variables が実ネットワークへ接続しないよう全テストでモックする
+        patcher = patch('src.main.fetch_repository_variables', return_value={'product': {'prodname_vscode': 'Visual Studio Code'}})
+        self.mock_fetch_vars = patcher.start()
+        self.addCleanup(patcher.stop)
+
     @patch('src.main.sys.exit')
     @patch('src.main.init_docs_client')
     @patch('src.main.load_config')
@@ -63,7 +69,7 @@ class TestStep3(unittest.TestCase):
         mock_fetch_diffs.return_value = [diff]
         
         mock_resp = MagicMock()
-        mock_resp.text = "content"
+        mock_resp.text = "Welcome to {% data variables.product.prodname_vscode %}"
         mock_req_get.return_value = mock_resp
         
         mock_fetch_tabs.return_value = {"tabs": []}
@@ -86,6 +92,9 @@ class TestStep3(unittest.TestCase):
                 mock_exit.assert_not_called()
                 self.assertEqual(mock_apply.call_count, 2)
                 self.assertEqual(mock_fetch_tabs.call_count, 2)
+                self.mock_fetch_vars.assert_called_once_with('owner', 'repo', 'new_sha', 'fake')
+                # Liquid変数が解決された本文が Phase 2 に渡されること
+                self.assertEqual(mock_p2.call_args[0][2], {"docs/file.md": "Welcome to Visual Studio Code"})
                 mock_file.assert_called_with('last_commit_sha_owner_repo.txt', 'w', encoding='utf-8')
 
     @patch('src.main.sys.exit')

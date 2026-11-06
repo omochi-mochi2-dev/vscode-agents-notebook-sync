@@ -11,8 +11,10 @@ from src.github_client import (
     fetch_commit_diffs,
     fetch_all_files_as_added,
     analyze_folder_rename,
-    validate_failsafe
+    validate_failsafe,
+    fetch_repository_variables
 )
+from src.liquid_resolver import resolve_liquid_variables
 from src.docs_client import (
     init_docs_client,
     fetch_document_tabs,
@@ -61,6 +63,9 @@ def main(force: bool = False) -> None:
             else:
                 diffs = fetch_commit_diffs(base_sha, head_sha, owner, repo, github_token)
             
+            # Liquid変数定義の取得 (Phase 2 の前処理で使用)
+            repo_variables = fetch_repository_variables(owner, repo, head_sha, github_token)
+
             # 6. 自己修復の連動
             analyze_folder_rename(diffs, repository, 'config.yaml')
             
@@ -95,7 +100,7 @@ def main(force: bool = False) -> None:
                         try:
                             resp = requests.get(d.raw_content_url, headers=headers)
                             resp.raise_for_status()
-                            file_contents[d.filename] = resp.text
+                            file_contents[d.filename] = resolve_liquid_variables(resp.text, repo_variables)
                         except Exception as e:
                             logger.error(f"Failed to fetch raw content for {d.filename}: {e}")
                             raise

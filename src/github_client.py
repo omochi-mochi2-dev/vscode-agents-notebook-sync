@@ -2,7 +2,7 @@ import os
 import logging
 import requests
 import yaml
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from src.models import FileDiff
 
@@ -123,6 +123,69 @@ def fetch_commit_diffs(base_sha: str, head_sha: str, owner: str, repo: str, toke
         ))
         
     return diffs
+
+def fetch_repository_variables(owner: str, repo: str, ref: str, token: str, variables_dir: str = 'data/variables') -> Dict[str, Dict[str, str]]:
+    """
+    リポジトリの data/variables/ 配下の .yml/.yaml を取得・パースし、
+    {"product": {...}, "copilot": {...}} 形式の二重辞書として返す。
+    取得・パースに失敗した場合は警告/エラーログを出力し、該当分をスキップする。
+    """
+    headers: Dict[str, str] = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    list_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{variables_dir}"
+    logger.info(f"Fetching variable definitions from {list_url}")
+    try:
+        response = requests.get(list_url, headers=headers, params={"ref": ref})
+        if response.status_code == 404:
+            logger.warning(f"{variables_dir} not found in {owner}/{repo}@{ref}. No variables will be resolved.")
+            return {}
+        response.raise_for_status()
+        entries = response.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"GitHub API request failed: {e}")
+        if e.response is not None:
+            logger.error(f"Status code: {e.response.status_code}, Response body: {e.response.text}")
+        return {}
+    except ValueError as e:
+        logger.error(f"Invalid JSON response when listing {variables_dir}: {e}")
+        return {}
+
+    if not isinstance(entries, list):
+        logger.warning(f"Unexpected response when listing {variables_dir}; expected a directory.")
+        return {}
+
+    result: Dict[str, Dict[str, str]] = {}
+    for entry in entries:
+        name: str = entry.get('name', '')
+        if entry.get('type') != 'file' or not name.endswith(('.yml', '.yaml')):
+            continue
+        download_url: Optional[str] = entry.get('download_url')
+        if not download_url:
+            logger.warning(f"No download_url for {name}. Skipping.")
+            continue
+        key = name.rsplit('.', 1)[0]
+        try:
+            file_resp = requests.get(download_url, headers=headers)
+            file_resp.raise_for_status()
+            parsed = yaml.safe_load(file_resp.text)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to fetch variable file {name}: {e}")
+            if e.response is not None:
+                logger.error(f"Status code: {e.response.status_code}, Response body: {e.response.text}")
+            continue
+        except yaml.YAMLError as e:
+            logger.error(f"Failed to parse YAML file {name}: {e}")
+            continue
+        if not isinstance(parsed, dict):
+            logger.warning(f"Variable file {name} is not a mapping. Skipping.")
+            continue
+        result[key] = parsed
+
+    logger.info(f"Loaded variable files: {sorted(result.keys())}")
+    return result
 
 def analyze_folder_rename(diffs: List[FileDiff], repository: str, config_path: str = 'config.yaml') -> None:
     try:
