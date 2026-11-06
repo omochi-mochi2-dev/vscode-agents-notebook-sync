@@ -30,6 +30,18 @@ def test_resolve_liquid_variables_missing_key() -> None:
     assert resolve_liquid_variables("text", {}) == "text"
 
 
+def test_resolve_liquid_variables_key_with_spaces() -> None:
+    variables: Dict[str, Dict[str, str]] = {
+        "copilot": {"next edit suggestions": "next edit suggestions (NES)", "chat_view": "Chat view"},
+    }
+    content = "Use {% data variables.copilot.next edit suggestions %} and {%data variables.copilot.next edit suggestions%} with {% data variables.copilot.chat_view %}."
+    assert resolve_liquid_variables(content, variables) == (
+        "Use next edit suggestions (NES) and next edit suggestions (NES) with Chat view."
+    )
+    missing = "{% data variables.copilot.no such key %}"
+    assert resolve_liquid_variables(missing, variables) == missing
+
+
 def _resp(status: int = 200, json_data: Any = None, text: str = "") -> MagicMock:
     m = MagicMock()
     m.status_code = status
